@@ -1,0 +1,22 @@
+{
+  "name": "xiaohongshu-mcp",
+  "version": "0.1.0",
+  "description": "Xiaohongshu (小红书) MCP server with persistent QR login: search notes, read details and comments from any AI client",
+  "type": "module",
+  "license": "MIT",
+  "bin": { "xiaohongshu-mcp": "./index.js" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Richard-Zhang1019/xiaohongshu-mcp.git"
+  },
+  "keywords": ["mcp", "xiaohongshu", "rednote", "scraper", "model-context-protocol"],
+  "scripts": {
+    "start": "node index.js",
+    "self-test": "node index.js --self-test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "playwright": "^1.54.0",
+    "zod": "^3.24.0"
+  }
+}
