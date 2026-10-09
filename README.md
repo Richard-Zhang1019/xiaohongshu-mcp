@@ -11,6 +11,8 @@
 | `search_notes` | 关键词搜索，返回标题/作者/点赞数/`note_id`/`xsec_token`/链接 |
 | `get_note_detail` | 按 `note_id` + `xsec_token` 读笔记正文、互动数据、标签 |
 | `get_note_comments` | 拉笔记评论（含楼中楼），攻略类笔记评论区常有重要补充 |
+| `list_chats` | 列出私信会话（chat_id、昵称、最后一条消息） |
+| `get_chat_notes` | 提取指定会话中**好友分享的笔记**（标题、作者、note_id、xsec_token、分享时间），结果可直接传给 `get_note_detail`（token 配 `xsec_source=app_share`） |
 
 ## 安装
 
@@ -52,10 +54,12 @@ Claude Code / 其他兼容 `mcpServers` 格式的客户端同理。
 
 ## 实现要点
 
-- **搜索主路线**：像真人一样在页面搜索框输入提交，拦截页面自己发出的签名 XHR 拿结构化 JSON。这是唯一稳定可靠的路线——外部复刻签名请求（即使 `x-s`/`x-t` 合法）会被网关以 500 "invoker failed" 拒绝，且登录后立刻发这类请求会触发风控、导致 session 快速失效。
-- 备选路线：页面上下文内 `window._webmsxyw` 签名直调；兜底：搜索结果页 DOM 提取。
-- 笔记正文从笔记页 `__INITIAL_STATE__` **严格按 note_id 索引**提取（map 里会混入相关推荐笔记，不能取第一个 key）；评论 API 失败时降级为笔记页首屏提取。
-- **登录判定用页面自证**（搜索框 placeholder），不信 cookie：`web_session` 存在但 session 被服务端失效时所有接口一律 500。判定固定在首页做（等 hydration 完成）。
+- **搜索主路线**：像真人一样在页面搜索框输入提交，拦截页面自己发出的签名 XHR 拿结构化 JSON。这是唯一稳定可靠的路线——外部复刻签名请求（即使 `x-s`/`x-t` 合法）会被网关以 500 "invoker failed" 拒绝，且登录后立刻发这类请求会触发风控、导致 session 快速失效。评论、私信历史同理：都改为拦截页面自己的 XHR。
+- **私信**：会话列表来自 `/chat` 页的 `im/web/v3/chats`；会话历史在 `/chat/{id}` 首屏 + 向上滚动触发 `messages/history` 分页；分享笔记消息 `content_type=3`，content 为双层 JSON，内层 `link`（`xhsdiscover://item/{id}?...xsec_token=`）提供 note_id 与 token（App 分享来源，读正文配 `xsec_source=app_share`）。
+- 备选路线：页面上下文内 `window._webmsxyw` 签名直调；兜底：搜索结果页 DOM 提取、笔记页 `__INITIAL_STATE__` 提取。
+- 笔记正文从笔记页 `__INITIAL_STATE__` **严格按 note_id 索引**提取（map 里会混入相关推荐笔记，不能取第一个 key）。
+- **登录判定用页面自证**（搜索框 placeholder），不信 cookie：`web_session` 存在但 session 被服务端失效时所有接口一律 500。判定固定在首页做（等 hydration 完成），结果缓存 5 分钟（同一浏览器实例内不重复判定）。
+- **客户端工具超时**：ZCode 等客户端默认 30s，可在 MCP 配置加 `"timeoutMs": 120000`；服务端各等待均已压缩，冷启动路径也能过关；等待扫码的 login 必须异步（弹窗立即返回）。
 - 点赞数标准化（"1.2万" → 12000、"999+" → 999）。
 - 默认有头模式（工具调用时会短暂弹出 Chrome 窗口，这是不被风控的关键）；设 `XHS_HEADLESS=1` 可切无头。
 - 浏览器实例共享复用、空闲 10 分钟自动回收；工具调用串行化；进程退出时 `-9` 强杀浏览器防泄漏。
@@ -64,7 +68,9 @@ Claude Code / 其他兼容 `mcpServers` 格式的客户端同理。
 ## 诊断
 
 ```bash
-npm run self-test   # 端到端：登录判定 + UI 搜索全链路（与 MCP 工具调用同路径）
+npm run self-test                      # 端到端：登录判定 + UI 搜索（与 MCP 调用同路径）
+node index.js --self-test --chats      # 验证私信会话列表
+node index.js --self-test --chat-notes=<chat_id>   # 验证某会话中分享的笔记
 ```
 
 ## License

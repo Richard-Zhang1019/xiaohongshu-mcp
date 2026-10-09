@@ -169,6 +169,9 @@ async function isLoggedIn(page) {
 
 async function loginGuard() {
   const page = await openPage();
+  // 判定缓存：同一浏览器实例 5 分钟内不重复回首页判定（避免每次工具调用多一次导航，
+  // 把冷启动路径压进客户端 30s 工具超时以内）
+  if (shared.verifiedAt && Date.now() - shared.verifiedAt < 5 * 60_000) return { page };
   // 登录判定固定在首页做：其他页面（搜索结果页等）的 placeholder 语义不一致
   if (!/^https:\/\/www\.xiaohongshu\.com\/(explore)?\/?$/.test(page.url().split('?')[0])) {
     await page.goto(HOME_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => null);
@@ -179,6 +182,7 @@ async function loginGuard() {
         '小红书登录态缺失或已失效（cookie 可能在但 session 已过期，特征是接口 500 invoker failed）。请提示用户调用 xiaohongshu 的 login 工具重新扫码。',
     };
   }
+  shared.verifiedAt = Date.now();
   return { page };
 }
 
@@ -335,28 +339,29 @@ async function doSearchViaUI(page, keyword, limit) {
   };
   page.on('response', onRes);
   try {
-    if (!/^https:\/\/www\.xiaohongshu\.com/.test(page.url())) {
+    // 搜索固定在首页做：首页搜索框行为最标准，也避免在其他页面白等特征元素
+    if (!/^https:\/\/www\.xiaohongshu\.com\/(explore)?\/?$/.test(page.url().split('?')[0])) {
       await page.goto(HOME_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
     }
-    const input = await page.waitForSelector('#search-input', { timeout: 15_000 });
-    // 等 Vue 应用挂载完成（feed 卡片出现）：过早 fill 的值不会被组件接管
-    await page.waitForSelector('a[href*="/explore/"]', { timeout: 10_000 }).catch(() => null);
-    await sleep(1000);
+    const input = await page.waitForSelector('#search-input', { timeout: 10_000 });
+    // 等 Vue 应用挂载完成（feed 卡片出现）：过早 type 的值不会被组件接管
+    await page.waitForSelector('a[href*="/explore/"]', { timeout: 6_000 }).catch(() => null);
+    await sleep(800);
     await input.click();
     await page.keyboard.type(keyword, { delay: 50 });
     await page.keyboard.press('Enter');
-    let deadline = Date.now() + 15_000;
-    while (!captured.length && Date.now() < deadline) await sleep(600);
+    let deadline = Date.now() + 12_000;
+    while (!captured.length && Date.now() < deadline) await sleep(500);
     if (!captured.length) {
       // Enter 未提交时重输一次再点搜索按钮
       await page.click('#search-input', { clickCount: 3 });
       await page.keyboard.type(keyword, { delay: 50 });
       await page.keyboard.press('Enter');
       await page.click('.input-button').catch(() => null);
-      deadline = Date.now() + 10_000;
-      while (!captured.length && Date.now() < deadline) await sleep(600);
+      deadline = Date.now() + 8_000;
+      while (!captured.length && Date.now() < deadline) await sleep(500);
     }
-    await sleep(1200); // 多收一拍瀑布流数据
+    await sleep(1000); // 多收一拍瀑布流数据
   } finally {
     page.off('response', onRes);
   }
@@ -460,7 +465,7 @@ async function doSearch(keyword, limit = 20, { skipLoginCheck = false } = {}) {
   return { error: viaUI.error };
 }
 
-async function getNoteDetail(noteId, xsecToken) {
+async function getNoteDetail(noteId, xsecToken, xsecSource) {
   const guard = await loginGuard();
   if (guard.error) return guard;
   const page = guard.page;
@@ -468,10 +473,12 @@ async function getNoteDetail(noteId, xsecToken) {
 
   const url =
     `https://www.xiaohongshu.com/explore/${noteId}` +
-    (xsecToken ? `?xsec_token=${encodeURIComponent(xsecToken)}&xsec_source=pc_search` : '');
+    (xsecToken
+      ? `?xsec_token=${encodeURIComponent(xsecToken)}&xsec_source=${xsecSource || 'pc_search'}`
+      : '');
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
   await page
-    .waitForFunction(() => window.__INITIAL_STATE__ !== undefined, null, { timeout: 15_000 })
+    .waitForFunction(() => window.__INITIAL_STATE__ !== undefined, null, { timeout: 10_000 })
     .catch(() => null);
 
   const data = await page.evaluate((nid) => {
@@ -552,39 +559,115 @@ async function getNoteDetail(noteId, xsecToken) {
   };
 }
 
-async function getComments(noteId, xsecToken, limit = 30) {
+function countCaptured(captured) {
+  return captured.reduce((n, j) => n + (j.data?.comments?.length || 0), 0);
+}
+
+async function getComments(noteId, xsecToken, limit = 30, xsecSource) {
   const guard = await loginGuard();
   if (guard.error) return guard;
   const page = guard.page;
   shared.lastUsed = Date.now();
 
-  if (!(await ensureSignFn(page))) {
-    return { error: '页面签名函数不可用（可能被风控），建议重新调用 login 工具' };
+  // 主路线：打开笔记页拦截页面自己的评论 XHR（复刻签名直调会被网关 500 拒）
+  const viaPage = await getCommentsViaPage(page, noteId, xsecToken, limit, xsecSource).catch(
+    (e) => ({ error: String(e) })
+  );
+  if (!viaPage.error) return viaPage;
+
+  // 备选：页面上下文内签名直调（可翻页，但历史经验常被网关拒）
+  if (await ensureSignFn(page)) {
+    const flat = [];
+    let cursor = '';
+    for (let round = 0; round < 5 && flat.length < limit; round++) {
+      const data = {
+        note_id: noteId,
+        cursor,
+        top_comment_id: '',
+        image_formats: ['jpg', 'webp', 'avif'],
+      };
+      if (xsecToken) data.xsec_token = xsecToken;
+      const r = await apiPost(page, '/api/sns/web/v1/comment/page', data);
+      const j = r.json;
+      if (!j || j.success !== true) break;
+      const comments = j.data?.comments || [];
+      for (const c of comments) {
+        flat.push({
+          author: c.user?.nickname || '',
+          content: c.content || '',
+          likes: stdLikes(c.like_count),
+          time: c.time ? new Date(Number(c.time)).toISOString().slice(0, 10) : '',
+          ip_location: c.ip_location || '',
+          sub_comments: (c.sub_comments || []).map((s) => ({
+            author: s.user?.nickname || '',
+            content: s.content || '',
+            likes: stdLikes(s.like_count),
+          })),
+        });
+      }
+      cursor = j.data?.cursor || '';
+      if (!j.data?.has_more || comments.length === 0) break;
+      await sleep(600 + Math.random() * 600);
+    }
+    if (flat.length) {
+      return { note_id: noteId, count: Math.min(flat.length, limit), via: 'signed_api', comments: flat.slice(0, limit) };
+    }
+  }
+  return { error: viaPage.error };
+}
+
+/** 评论主路线：打开笔记页，拦截页面自己发的评论 XHR，滚动加载更多 */
+async function getCommentsViaPage(page, noteId, xsecToken, limit, xsecSource) {
+  const url =
+    `https://www.xiaohongshu.com/explore/${noteId}` +
+    (xsecToken
+      ? `?xsec_token=${encodeURIComponent(xsecToken)}&xsec_source=${xsecSource || 'pc_search'}`
+      : '');
+  const captured = [];
+  const onRes = async (res) => {
+    if (/\/api\/sns\/web\/v\d+\/comment\//.test(res.url())) {
+      try {
+        const j = await res.json();
+        if (j?.success) captured.push(j);
+      } catch {}
+    }
+  };
+  page.on('response', onRes);
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    // 笔记页会自动请求首屏评论
+    let deadline = Date.now() + 8000;
+    while (!captured.length && Date.now() < deadline) await sleep(500);
+    // 向下滚动评论区加载更多
+    for (let round = 0; round < 3; round++) {
+      if (countCaptured(captured) >= limit) break;
+      const before = countCaptured(captured);
+      await page
+        .evaluate(() => {
+          const sc =
+            document.querySelector('.note-scroller') ||
+            document.querySelector('.comments-el')?.closest('[class*=scroll]') ||
+            document.scrollingElement;
+          if (sc) sc.scrollTop = sc.scrollTop + 1400;
+        })
+        .catch(() => null);
+      await sleep(1800);
+      if (countCaptured(captured) === before) break;
+    }
+  } finally {
+    page.off('response', onRes);
   }
 
+  // 解析拦截到的评论（结构与 API 直调一致）
+  const seen = new Set();
   const flat = [];
-  let cursor = '';
-  for (let round = 0; round < 5 && flat.length < limit; round++) {
-    const data = {
-      note_id: noteId,
-      cursor,
-      top_comment_id: '',
-      image_formats: ['jpg', 'webp', 'avif'],
-    };
-    if (xsecToken) data.xsec_token = xsecToken;
-    const r = await apiPost(page, '/api/sns/web/v1/comment/page', data);
-    const j = r.json;
-    if (!j || j.success !== true) {
-      // 评论 API 被拒时，降级为打开笔记页提取首屏评论
-      const fb = await getCommentsViaPage(page, noteId, xsecToken, limit).catch(() => null);
-      if (fb && !fb.error) return fb;
-      return { error: apiError(j, r.status, r.rawHead) };
-    }
-    const comments = j.data?.comments || [];
-    for (const c of comments) {
+  for (const j of captured) {
+    for (const c of j.data?.comments || []) {
+      if (!c?.content || seen.has(c.id)) continue;
+      seen.add(c.id);
       flat.push({
         author: c.user?.nickname || '',
-        content: c.content || '',
+        content: c.content,
         likes: stdLikes(c.like_count),
         time: c.time ? new Date(Number(c.time)).toISOString().slice(0, 10) : '',
         ip_location: c.ip_location || '',
@@ -595,23 +678,18 @@ async function getComments(noteId, xsecToken, limit = 30) {
         })),
       });
     }
-    cursor = j.data?.cursor || '';
-    if (!j.data?.has_more || comments.length === 0) break;
-    await sleep(600 + Math.random() * 600);
   }
-  return { note_id: noteId, count: Math.min(flat.length, limit), comments: flat.slice(0, limit) };
-}
+  if (flat.length) {
+    return {
+      note_id: noteId,
+      count: Math.min(flat.length, limit),
+      via: 'page_xhr',
+      comments: flat.slice(0, limit),
+    };
+  }
 
-/** 评论降级路线：打开笔记页，从 __INITIAL_STATE__ 提取首屏评论 */
-async function getCommentsViaPage(page, noteId, xsecToken, limit) {
-  const url =
-    `https://www.xiaohongshu.com/explore/${noteId}` +
-    (xsecToken ? `?xsec_token=${encodeURIComponent(xsecToken)}&xsec_source=pc_search` : '');
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-  await page
-    .waitForFunction(() => window.__INITIAL_STATE__ !== undefined, null, { timeout: 15_000 })
-    .catch(() => null);
-  await sleep(1200);
+  // 兜底：__INITIAL_STATE__ 首屏评论
+  await sleep(800);
   const raw = await page.evaluate((nid) => {
     let s = window.__INITIAL_STATE__;
     if (typeof s === 'string') {
@@ -639,7 +717,7 @@ async function getCommentsViaPage(page, noteId, xsecToken, limit) {
         comments.push({
           author: c.user?.nickname || c.userInfo?.nickname || '',
           content,
-          likes: c.like_count ?? c.likeCount ?? 0,
+          likes: stdLikes(c.like_count ?? c.likeCount),
           time: c.createTime ? new Date(Number(c.createTime)).toISOString().slice(0, 10) : '',
         });
       }
@@ -652,14 +730,172 @@ async function getCommentsViaPage(page, noteId, xsecToken, limit) {
   }, noteId);
   const stateErr = detectPageState(raw.url, raw.pageText);
   if (stateErr) return { error: stateErr };
-  if (!raw.comments.length) return { error: '首屏未提取到评论（可能无评论或需滚动加载）' };
+  if (!raw.comments.length) return { error: '未能加载评论（笔记可能无评论，或缺 xsec_token 无法打开笔记）' };
   return {
     note_id: noteId,
     count: Math.min(raw.comments.length, limit),
-    via: 'page_fallback',
-    comments: raw.comments
-      .slice(0, limit)
-      .map((c) => ({ ...c, likes: stdLikes(c.likes) })),
+    via: 'state_fallback',
+    comments: raw.comments.slice(0, limit),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 私信：会话列表 + 好友分享的笔记
+// 页面结构（2026-10 实测）：/chat 列表页拉 /api/.../chats；会话页 /chat/{id} 首屏
+// 渲染最近消息，向上滚动触发 /api/im/web/messages/history 分页。分享笔记消息的
+// content 是双层 JSON（外层 content_type=3，内层 type="note"，link 为
+// xhsdiscover://item/{note_id}?...xsec_token=...）。
+// ---------------------------------------------------------------------------
+async function listChats() {
+  const guard = await loginGuard();
+  if (guard.error) return guard;
+  const page = guard.page;
+  shared.lastUsed = Date.now();
+
+  const captured = [];
+  const onRes = async (res) => {
+    const u = res.url();
+    if (/\/api\/(sns\/v1\/im\/web\/get_recent_chats|im\/web\/v3\/chats)\b/.test(u)) {
+      try {
+        captured.push(await res.json());
+      } catch {}
+    }
+  };
+  page.on('response', onRes);
+  try {
+    await page.goto('https://www.xiaohongshu.com/chat', {
+      waitUntil: 'domcontentloaded',
+      timeout: 60_000,
+    });
+    const deadline = Date.now() + 10_000;
+    while (!captured.length && Date.now() < deadline) await sleep(700);
+    await sleep(1000);
+  } finally {
+    page.off('response', onRes);
+  }
+  if (!captured.length) {
+    return { error: '未捕获到会话列表接口（页面可能未登录或结构变化）' };
+  }
+  const chats = [];
+  const seen = new Set();
+  for (const j of captured) {
+    const list = j?.data?.chats || j?.data?.list || [];
+    for (const c of list) {
+      const id = c.chat_user_id || c.chat_id || c.user_id;
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      chats.push({
+        chat_id: id,
+        name: c.info?.nickname || c.name || '',
+        is_friend: c.info?.is_friend ?? null,
+        last_message: c.last_msg_content || c.last_msg || '',
+      });
+    }
+  }
+  if (!chats.length) return { error: '会话列表为空（可能无私信或结构变化）' };
+  return { count: chats.length, chats };
+}
+
+/** 解析一条消息里的分享笔记；非笔记分享返回 null */
+function parseSharedNote(msg, peerId) {
+  let c1 = null;
+  try {
+    c1 = JSON.parse(msg.content);
+  } catch {
+    return null;
+  }
+  if (!c1 || c1.content_type !== 3) return null; // 3 = 卡片分享
+  let c2 = null;
+  try {
+    c2 = JSON.parse(c1.content);
+  } catch {
+    return null;
+  }
+  if (!c2) return null;
+  const link = c2.link || '';
+  const isNote = c2.type === 'note' || link.includes('://item/');
+  if (!isNote) return null;
+  let noteId = c2.id || '';
+  let token = '';
+  try {
+    const u = new URL(link.replace(/^xhsdiscover:\/\//, 'https://item.host/'));
+    const m = u.pathname.match(/item\/([0-9a-f]{16,})/);
+    if (m) noteId = m[1];
+    token = u.searchParams.get('xsec_token') || '';
+  } catch {}
+  if (!noteId) return null;
+  return {
+    note_id: noteId,
+    xsec_token: token,
+    title: c2.title || c2.frontChain || '',
+    author: c2.user?.nickname || '',
+    sent_by_me: msg.sender_id !== peerId,
+    sent_at: msg.created_at
+      ? new Date(Number(msg.created_at)).toISOString().slice(0, 16).replace('T', ' ')
+      : '',
+    _ts: Number(msg.created_at) || 0,
+  };
+}
+
+async function getChatNotes(chatId, limit = 20) {
+  const guard = await loginGuard();
+  if (guard.error) return guard;
+  const page = guard.page;
+  shared.lastUsed = Date.now();
+
+  const msgs = [];
+  const onRes = async (res) => {
+    if (!res.url().includes('/api/im/web/messages/history')) return;
+    try {
+      const j = await res.json();
+      for (const m of j?.data?.out_message_list || []) msgs.push(m);
+    } catch {}
+  };
+  page.on('response', onRes);
+  try {
+    await page.goto(`https://www.xiaohongshu.com/chat/${chatId}`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60_000,
+    });
+    await sleep(5000); // 首屏消息渲染
+    // 向上滚动触发历史分页，直到无新数据
+    for (let round = 0; round < 4; round++) {
+      const before = msgs.length;
+      await page.evaluate(() => {
+        const w =
+          document.querySelector('.xhs-im-msg-list-wrap') ||
+          document.querySelector('.xhs-im-msg-list');
+        if (w) {
+          w.scrollTop = 0;
+          w.dispatchEvent(new Event('scroll'));
+        }
+      });
+      await sleep(2500);
+      if (msgs.length === before) break;
+    }
+  } finally {
+    page.off('response', onRes);
+  }
+
+  const notes = [];
+  const seen = new Set();
+  for (const m of msgs) {
+    const n = parseSharedNote(m, chatId);
+    if (!n || seen.has(n.note_id)) continue;
+    seen.add(n.note_id);
+    notes.push(n);
+  }
+  notes.sort((a, b) => b._ts - a._ts); // 最近分享在前
+  for (const n of notes) delete n._ts;
+  if (!notes.length) {
+    return { chat_id: chatId, message_count: msgs.length, note_count: 0, notes: [], hint: '已扫描的消息中无笔记分享（历史更早的分享需在聊天里手动上滑更多）' };
+  }
+  return {
+    chat_id: chatId,
+    message_count: msgs.length,
+    note_count: Math.min(notes.length, limit),
+    notes: notes.slice(0, limit),
+    hint: 'note_id/xsec_token 可直接传给 get_note_detail 读取正文（xsec_token 建议传 xsec_source=app_share）',
   };
 }
 
@@ -798,11 +1034,15 @@ server.registerTool(
       xsec_token: z
         .string()
         .optional()
-        .describe('来自 search_notes 结果的 xsec_token，缺失可能无法读取正文'),
+        .describe('来自 search_notes / get_chat_notes 结果的 xsec_token，缺失可能无法读取正文'),
+      xsec_source: z
+        .string()
+        .optional()
+        .describe('token 来源：search_notes 默认 pc_search；私信分享的笔记传 app_share'),
     },
   },
-  async ({ note_id, xsec_token }) =>
-    asText(await withLock(() => getNoteDetail(note_id, xsec_token)))
+  async ({ note_id, xsec_token, xsec_source }) =>
+    asText(await withLock(() => getNoteDetail(note_id, xsec_token, xsec_source)))
 );
 
 server.registerTool(
@@ -813,12 +1053,41 @@ server.registerTool(
       '拉取笔记评论（含楼中楼），攻略类笔记评论区常有重要补充信息。note_id/xsec_token 来自 search_notes 结果。',
     inputSchema: {
       note_id: z.string().describe('笔记 ID'),
-      xsec_token: z.string().optional().describe('来自 search_notes 结果的 xsec_token'),
+      xsec_token: z.string().optional().describe('来自 search_notes / get_chat_notes 结果的 xsec_token'),
+      xsec_source: z
+        .string()
+        .optional()
+        .describe('token 来源：search_notes 默认 pc_search；私信分享的笔记传 app_share'),
       limit: z.number().int().min(1).max(50).optional().describe('返回条数，默认 30'),
     },
   },
-  async ({ note_id, xsec_token, limit }) =>
-    asText(await withLock(() => getComments(note_id, xsec_token, limit ?? 30)))
+  async ({ note_id, xsec_token, xsec_source, limit }) =>
+    asText(await withLock(() => getComments(note_id, xsec_token, limit ?? 30, xsec_source)))
+);
+
+server.registerTool(
+  'list_chats',
+  {
+    title: '列出小红书私信会话',
+    description:
+      '列出当前账号最近的私信会话（chat_id、昵称、最后一条消息）。要查看好友分享的笔记，先用本工具拿到 chat_id，再调用 get_chat_notes。',
+    inputSchema: {},
+  },
+  async () => asText(await withLock(listChats))
+);
+
+server.registerTool(
+  'get_chat_notes',
+  {
+    title: '获取私信中分享的笔记',
+    description:
+      '打开指定私信会话，自动向上滚动加载历史消息，提取所有分享的笔记（标题、作者、note_id、xsec_token、分享时间、是好友发还是我发的）。返回结果可直接传给 get_note_detail 读正文（token 配 xsec_source=app_share）。',
+    inputSchema: {
+      chat_id: z.string().describe('会话 ID（来自 list_chats 结果的 chat_id，即 /chat/ 后的部分）'),
+      limit: z.number().int().min(1).max(50).optional().describe('最多返回分享笔记数，默认 20'),
+    },
+  },
+  async ({ chat_id, limit }) => asText(await withLock(() => getChatNotes(chat_id, limit ?? 20)))
 );
 
 // ---------------------------------------------------------------------------
@@ -850,12 +1119,23 @@ process.on('SIGINT', () => cleanup().finally(() => process.exit(0)));
 
 if (process.argv.includes('--self-test')) {
   // 端到端验证：登录判定 + UI 搜索全链路（与 MCP 工具调用同一路径）。
-  // 追加 --skip 可跳过登录检查，用于诊断签名/风控链路。
-  const skip = process.argv.includes('--skip');
-  const r = await doSearch('杭州天气', 5, { skipLoginCheck: skip }).catch((e) => ({
-    error: String(e),
-  }));
-  console.log(JSON.stringify(r, null, 2));
+  // 追加 --skip 可跳过登录检查，用于诊断签名/风控链路；--chats 验证私信会话列表；
+  // --chat-notes=<id> 验证指定会话中分享的笔记。
+  const argv = process.argv;
+  if (argv.includes('--chats')) {
+    const r = await listChats().catch((e) => ({ error: String(e) }));
+    console.log(JSON.stringify(r, null, 2));
+  } else if (argv.some((a) => a.startsWith('--chat-notes='))) {
+    const id = argv.find((a) => a.startsWith('--chat-notes=')).split('=')[1];
+    const r = await getChatNotes(id, 10).catch((e) => ({ error: String(e) }));
+    console.log(JSON.stringify(r, null, 2));
+  } else {
+    const skip = argv.includes('--skip');
+    const r = await doSearch('杭州天气', 5, { skipLoginCheck: skip }).catch((e) => ({
+      error: String(e),
+    }));
+    console.log(JSON.stringify(r, null, 2));
+  }
   await cleanup();
   process.exit(0);
 }
